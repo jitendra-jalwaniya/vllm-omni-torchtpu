@@ -20,6 +20,7 @@ import copy
 import gc
 import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -44,6 +45,7 @@ _UPSTREAM_GUIDE_MODALITY = ltx2_guidance.LTXGuidanceExecutor._guide_modality
 _UPSTREAM_SYNC_GUIDANCE_STEP = (
     ltx2_runtime.LTXRuntime._synchronize_guidance_parallel_step_output
 )
+_UPSTREAM_LTX2_ATTN_FORWARD = ltx2_transformer.LTX2Attention.forward
 
 
 class _DummyLTX2Pipeline(
@@ -738,3 +740,133 @@ def test_ltx2_async_guidance_step_avoids_blocking_sync(
 
     # No path calls upstream's blocking device synchronize.
     assert blocking_syncs == []
+
+
+def test_ltx2_fast_attention_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import inspect
+
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2Attention, "forward", _UPSTREAM_LTX2_ATTN_FORWARD
+    )
+    ltx2_patches._patch_ltx2_fast_attention_dispatch()
+    ltx2_patches._patch_ltx2_fast_attention_dispatch()  # idempotent
+    assert ltx2_transformer.LTX2Attention.forward is not _UPSTREAM_LTX2_ATTN_FORWARD
+
+    def default_call(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        perturbation_mask=None,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        out = hidden_states
+        return out if perturbation_mask is None else out + perturbation_mask
+
+    class _ExtraKwProc:
+        def __call__(
+            self,
+            attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=None,
+            query_rotary_emb=None,
+            key_rotary_emb=None,
+            *,
+            perturbation_mask=None,
+            extra_accepted=None,
+        ):
+            out = default_call(
+                None, attn, hidden_states, perturbation_mask=perturbation_mask
+            )
+            return out if extra_accepted is None else out + extra_accepted
+
+    class _NoMaskProc:
+        def __call__(
+            self,
+            attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            attention_mask=None,
+            query_rotary_emb=None,
+            key_rotary_emb=None,
+        ):
+            return hidden_states * 2
+
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2AudioVideoAttnProcessor, "__call__", default_call
+    )
+    dummy_attn = object.__new__(ltx2_transformer.LTX2Attention)
+    torch.nn.Module.__init__(dummy_attn)
+    x = torch.ones(2, 4, 8)
+    pmask = torch.full((2, 1, 1), 2.0)
+
+    def both(*args, **kwargs):
+        got = dummy_attn(*args, **kwargs)
+        want = _UPSTREAM_LTX2_ATTN_FORWARD(dummy_attn, *args, **kwargs)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+        return got
+
+    with patch.object(inspect, "signature", wraps=inspect.signature) as spy_sig:
+        # The default processor's plain call never reflects.
+        dummy_attn.processor = ltx2_transformer.LTX2AudioVideoAttnProcessor()
+        spy_sig.reset_mock()
+        dummy_attn(x, perturbation_mask=pmask)
+        dummy_attn(x)
+        assert spy_sig.call_count == 0
+        torch.testing.assert_close(dummy_attn(x, perturbation_mask=pmask), x + 2.0)
+
+        # Extra kwargs reflect once per processor class, then hit the cache.
+        dummy_attn.processor = _ExtraKwProc()
+        spy_sig.reset_mock()
+        dummy_attn(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
+        out = dummy_attn(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
+        assert spy_sig.call_count == 1
+        torch.testing.assert_close(out, x + 3.0)
+
+    # A custom processor without perturbation_mask is not handed one (it is
+    # filtered out with upstream's warning), matching upstream in every case.
+    dummy_attn.processor = _NoMaskProc()
+    both(x)
+    both(x, perturbation_mask=pmask)
+    dummy_attn.processor = _ExtraKwProc()
+    both(x, perturbation_mask=pmask, extra_accepted=1.0, ignored_kw=9.0)
+
+    # Distinct plain-function processors must not collide on type(processor)
+    # in sig_cache.
+    def _fn_proc_a(
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        *,
+        alpha=0.0,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        return hidden_states + alpha
+
+    def _fn_proc_b(
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        query_rotary_emb=None,
+        key_rotary_emb=None,
+        *,
+        beta=0.0,
+    ):
+        del attn, encoder_hidden_states, attention_mask
+        del query_rotary_emb, key_rotary_emb
+        return hidden_states + beta
+
+    dummy_attn.processor = _fn_proc_a
+    torch.testing.assert_close(dummy_attn(x, alpha=2.0, beta=5.0), x + 2.0)
+    dummy_attn.processor = _fn_proc_b
+    torch.testing.assert_close(dummy_attn(x, alpha=2.0, beta=5.0), x + 5.0)
