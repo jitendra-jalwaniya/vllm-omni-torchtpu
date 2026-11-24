@@ -48,10 +48,11 @@ import numpy as np
 VBENCH_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPTS_JSON = VBENCH_DIR / "VBench_full_info_sub110.json"
 # The complete VBench prompt set is VBench's file, so it is not kept in this
-# repository. `--prompts-json full` fetches it from the VBench repository. The
-# commit and checksum are pinned: video names carry the prompt's index in this
-# file, so the file must not change between generation and evaluation.
-FULL_PROMPTS_JSON = VBENCH_DIR / "VBench_full_info.json"
+# repository. `--prompts-json full` downloads it from the VBench repository into
+# a cache directory outside the repository. The commit and checksum are pinned:
+# video names carry the prompt's index in this file, so the file must not
+# change between generation and evaluation.
+FULL_PROMPTS_NAME = "VBench_full_info.json"
 FULL_PROMPTS_URL = (
     "https://raw.githubusercontent.com/Vchitect/VBench/"
     "fd18b3d055cb0fc6f066ca90fe2c3c8cbb698490/vbench/VBench_full_info.json"
@@ -207,14 +208,28 @@ def fetch_file(url: str, sha256: str, dest: Path) -> None:
     os.replace(tmp_path, dest)
 
 
+def full_prompts_path() -> Path:
+    """Where the downloaded full prompt set is kept: under ``$XDG_CACHE_HOME``."""
+    cache_home = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(cache_home) / "vllm_omni_torchtpu" / "vbench" / FULL_PROMPTS_NAME
+
+
 def resolve_prompts_json(value: str) -> Path:
-    """Return the prompt file for ``--prompts-json``, fetching the full set if asked."""
+    """Return the prompt file for ``--prompts-json``, downloading the full set if asked.
+
+    A cached copy is used only if it still matches the pinned checksum.
+    """
     if value != "full":
         return Path(value)
-    if not FULL_PROMPTS_JSON.is_file():
-        print(f"[vbench] Fetching {FULL_PROMPTS_URL}", flush=True)
-        fetch_file(FULL_PROMPTS_URL, FULL_PROMPTS_SHA256, FULL_PROMPTS_JSON)
-    return FULL_PROMPTS_JSON
+    path = full_prompts_path()
+    if path.is_file():
+        if hashlib.sha256(path.read_bytes()).hexdigest() == FULL_PROMPTS_SHA256:
+            return path
+        print(f"[vbench] {path} does not match the pinned checksum", flush=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[vbench] Downloading {FULL_PROMPTS_URL} to {path}", flush=True)
+    fetch_file(FULL_PROMPTS_URL, FULL_PROMPTS_SHA256, path)
+    return path
 
 
 def load_prompts(path: Path) -> list[str]:

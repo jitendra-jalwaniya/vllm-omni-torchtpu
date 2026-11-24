@@ -28,8 +28,9 @@ which is why scoring runs on a separate GPU host.
   enough to catch a quality regression.
 
 The complete VBench prompt set (946 prompts) is not kept in this repository.
-`--prompts-json full` downloads VBench's `VBench_full_info.json` to this
-directory on first use, pinned to a VBench commit and checksum.
+`--prompts-json full` downloads VBench's `VBench_full_info.json` from the VBench
+repository, pinned to a commit and checksum, and caches it under
+`~/.cache/vllm_omni_torchtpu/vbench/` (or `$XDG_CACHE_HOME`).
 
 ## Generate Videos on TPU
 

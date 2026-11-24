@@ -22,6 +22,7 @@ import argparse
 import collections
 import hashlib
 import json
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,31 +47,37 @@ def test_bundled_subset_covers_every_dimension_evenly() -> None:
     ]
 
 
-def test_full_prompt_set_is_fetched_once_and_checksummed(
+def test_full_prompt_set_is_downloaded_to_the_cache_and_checksummed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     upstream = tmp_path / "upstream.json"
     upstream.write_text('[{"prompt_en": "a dog", "dimension": ["scene"]}]')
-    dest = tmp_path / "VBench_full_info.json"
-    monkeypatch.setattr(generate_videos, "FULL_PROMPTS_JSON", dest)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(generate_videos, "FULL_PROMPTS_URL", upstream.as_uri())
+    cached = tmp_path / "cache/vllm_omni_torchtpu/vbench/VBench_full_info.json"
+    assert generate_videos.full_prompts_path() == cached
 
-    # Content other than the pinned one is refused and leaves nothing behind.
+    # Content other than the pinned one is refused and leaves no file behind.
     monkeypatch.setattr(generate_videos, "FULL_PROMPTS_SHA256", "0" * 64)
     with pytest.raises(RuntimeError, match="expected 0000"):
         generate_videos.resolve_prompts_json("full")
-    assert list(tmp_path.iterdir()) == [upstream]
+    assert not cached.exists()
 
     digest = hashlib.sha256(upstream.read_bytes()).hexdigest()
     monkeypatch.setattr(generate_videos, "FULL_PROMPTS_SHA256", digest)
-    assert generate_videos.resolve_prompts_json("full") == dest
-    assert generate_videos.load_prompts(dest) == ["a dog"]
+    assert generate_videos.resolve_prompts_json("full") == cached
+    assert generate_videos.load_prompts(cached) == ["a dog"]
 
-    # An existing file is used as is, without another download.
+    # A valid cached copy is used without another download...
     upstream.unlink()
-    assert generate_videos.resolve_prompts_json("full") == dest
-    # Anything else is a path.
+    assert generate_videos.resolve_prompts_json("full") == cached
+    # ...but a modified one is downloaded again.
+    cached.write_text("[]")
+    with pytest.raises(urllib.error.URLError):
+        generate_videos.resolve_prompts_json("full")
+    # Anything else is a path, and nothing is written next to the scripts.
     assert generate_videos.resolve_prompts_json("my.json") == Path("my.json")
+    assert not (VBENCH_DIR / "VBench_full_info.json").exists()
 
 
 def test_parse_key_values() -> None:

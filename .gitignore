@@ -30,6 +30,3 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
-
-# Fetched from the VBench repository by benchmarks/vbench/generate_videos.py
-benchmarks/vbench/VBench_full_info.json
