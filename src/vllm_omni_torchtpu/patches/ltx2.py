@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import torch
@@ -22,12 +23,284 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+_SPLIT_ROPE_PATCHED = "_tpu_split_rope_patched"
+# Upper bounds on the split-RoPE rotation caches. A single LTX-2 request uses
+# a small handful of distinct table slices (video, cross-attention, audio) and
+# tensor objects. A rope module that replaces its tables releases their owned
+# copies itself; clearing on overflow bounds HBM for tables that are never
+# replaced (a dropped pipeline).
+_MAX_OWNED_ROPE_LAYOUTS = 8
+_MAX_ROPE_VIEW_ENTRIES = 16
 _LTX2_PER_BATCH_TIMESTEP_PATCHED = "_tpu_ltx2_per_batch_timestep_patched"
 
 
 def apply_ltx2_patches() -> None:
     """Apply LTX-2-specific diffusion runtime patches."""
+    _patch_ltx2_split_rope()
     _patch_ltx2_per_batch_timestep()
+
+
+def _patch_ltx2_split_rope() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni's LTX-2 split RoPE rotates q and
+    # k in their (B, T, H * D) layout instead of reshaping them per head.
+    #
+    # Problem: LTX2AudioVideoRotaryPosEmbed builds split-RoPE tables as
+    #   (B, H, T, D/2), so apply_split_rotary_emb transposes every (B, T, H * D)
+    #   q and k to (B, H, T, D) and back in each attention layer. The pipeline
+    #   passes the same coords tensor at every denoising step, and the rope
+    #   modules rebuild the tables each time.
+    # Fix: the rope module returns the tables in the layout of q and k,
+    #   (B, 1, T, H * D) with the sign of each half folded into sin
+    #   (split_rope_natural_tables), and apply_split_rotary_emb rotates them
+    #   elementwise. Each rope module keeps the tables of its last split-RoPE
+    #   call and returns them while the key matches, until a call with
+    #   another key replaces them.
+    # Effect: LTX-2 T2V 704x1280x121, 40 steps, on TPU v7x: 0.770 -> 0.482
+    #   s/step (-37%).
+    # Scope:
+    #   - T stays at dim 2, where the split-RoPE sequence-parallel (SP) plan
+    #     shards the tables.
+    #   - TP: _slice_rope_for_tp slices 4-D tables by heads on dim 1 and so
+    #     passes these (B, 1, T, H * D) tables through whole; the rotation
+    #     takes the lanes of the local heads.
+    #   - Cache key: the storage of coords (its data pointer; Tensor.is_set_to
+    #     is not implemented for TPU), the layout of coords on it (storage
+    #     offset, shape, stride), its dtype, device and version counter, and
+    #     the device and out_dtype arguments. Fresh views with the same layout,
+    #     such as the cross-attention ropes' coords[:, 0:1, :] each step, hit
+    #     in and out of inference mode. The cache holds the coords view, which
+    #     keeps the storage alive, so its address is not reused while cached.
+    #     Inference tensors have no version counter, so in-place edits of
+    #     coords in inference mode are not seen (vLLM-Omni does not edit
+    #     coords after building them).
+    #   - Interleaved RoPE and (B, H, T, D/2) tables use the original
+    #     functions.
+    #   - synchronize_tensors materializes the cached tables once.
+    #   - SP hands each rank a dim-2 slice of the tables, and TP the lanes of
+    #     its heads. torch_tpu passes a program the buffer behind each
+    #     argument, so a rotation that reads a slice takes the full table as
+    #     an input and slices it again, in every attention layer. The
+    #     rotation reads fresh_buffer copies with a buffer of the slice's
+    #     shape instead, built once per table and slice layout and released
+    #     when the rope module replaces the tables; a slice whose storage has
+    #     no data pointer is rotated as before.
+    #   - The tables are not edited after the rope module builds them
+    #     (vLLM-Omni only slices them): the rotation caches below are keyed
+    #     on storage and layout, not on a version counter.
+    #   - The torch.compiler.is_compiling() branches keep these caches and
+    #     their storage queries out of a traced graph. No caller compiles the
+    #     LTX-2 blocks today, so they are only reached by the unit tests.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+    from vllm_omni_torchtpu.rope import (
+        apply_split_rotary_half_swap,
+        split_rope_natural_tables,
+    )
+
+    rope_cls = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed
+    if getattr(rope_cls.forward, _SPLIT_ROPE_PATCHED, False):
+        return
+    orig_rope_forward = rope_cls.forward
+    orig_apply_split_rotary_emb = ltx2_transformer.apply_split_rotary_emb
+
+    # (cos, sin) the rotation is handed -> the tables it reads.
+    #   - tables_by_view finds them by identity. The same tensor objects reach
+    #     every attention layer of a forward, so the hot path makes no storage
+    #     or layout query. An entry holds the pair by weak reference (a dead
+    #     reference never matches a tensor that reuses its id), the q/k width
+    #     and TP layout its lanes were cut for, and the owned tables, or None
+    #     for a pair that is rotated as is (never one whose lanes were cut).
+    #   - owned_tables holds one pair of owned tables per slice of a pair of
+    #     tables: the key is the storage of cos and sin (data pointers) and
+    #     the slice layout on it (storage offset, shape and stride of cos and
+    #     sin, dtype, device). Each forward slices fresh views of the same
+    #     tables, which hit here. Tables of the same shape (under TP the audio
+    #     and audio cross-attention tables) have separate entries. An entry
+    #     holds its slices, which keeps the storage alive, so a data pointer
+    #     is not reused while it is a key.
+    tables_by_view: dict[
+        int,
+        tuple[
+            weakref.ref[torch.Tensor],
+            weakref.ref[torch.Tensor],
+            int,
+            tuple[int, int] | None,
+            tuple[torch.Tensor, torch.Tensor] | None,
+        ],
+    ] = {}
+    owned_tables: dict[
+        tuple[Any, ...],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ] = {}
+
+    def _release_owned_tables(tables: tuple[torch.Tensor, torch.Tensor]) -> None:
+        """Drops the slices and owned copies cut from ``tables``."""
+        storage = (
+            tables[0].untyped_storage().data_ptr(),
+            tables[1].untyped_storage().data_ptr(),
+        )
+        stale = [key for key in owned_tables if key[:2] == storage]
+        if not stale:
+            return
+        for key in stale:
+            del owned_tables[key]
+        tables_by_view.clear()  # its entries hold the owned copies too
+
+    def _cached_rope_forward(
+        self: Any,
+        coords: torch.Tensor,
+        device: str | torch.device | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.rope_type != "split":
+            return orig_rope_forward(self, coords, device, out_dtype)
+        storage = coords.untyped_storage().data_ptr()
+        version = None if coords.is_inference() else coords._version
+        key = (
+            version,
+            coords.storage_offset(),
+            tuple(coords.shape),
+            coords.stride(),
+            coords.dtype,
+            coords.device,
+            device,
+            out_dtype,
+        )
+        cached = getattr(self, "_tpu_split_rope_cache", None)
+        if (
+            cached is not None
+            and storage != 0
+            and cached[0].untyped_storage().data_ptr() == storage
+            and cached[1] == key
+        ):
+            return cached[2]
+        if cached is not None:
+            # Release the replaced tables before the new ones are built: a
+            # call with another token count (two-stage refinement, another
+            # resolution) slices the new tables in another layout, which
+            # would otherwise leave the old slices pinning the old tables.
+            self._tpu_split_rope_cache = None
+            _release_owned_tables(cached[2])
+            del cached
+        tables = orig_rope_forward(self, coords, device, out_dtype)
+        if tables[0].ndim != 4:
+            return tables
+        tables = split_rope_natural_tables(*tables)
+        synchronize_tensors(list(tables), wait=False)
+        self._tpu_split_rope_cache = (coords, key, tables)
+        return tables
+
+    def _is_view(t: torch.Tensor) -> bool:
+        return (
+            not t.is_contiguous()
+            or t.storage_offset() != 0
+            or t.untyped_storage().nbytes() != t.numel() * t.element_size()
+        )
+
+    def _tp_layout() -> tuple[int, int]:
+        return (
+            ltx2_transformer.get_tensor_model_parallel_world_size(),
+            ltx2_transformer.get_tensor_model_parallel_rank(),
+        )
+
+    def _local_lanes(
+        cos: torch.Tensor, sin: torch.Tensor, width: int, tp_layout: tuple[int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tp_size, tp_rank = tp_layout
+        if cos.shape[-1] != width * tp_size:
+            raise ValueError(
+                f"LTX-2 split RoPE tables of width {cos.shape[-1]} do not "
+                f"match q/k of width {width} on {tp_size} tensor-parallel "
+                "ranks; the tables must cover all heads of all ranks."
+            )
+        start = tp_rank * width
+        return cos[..., start : start + width], sin[..., start : start + width]
+
+    def _rotation_tables(
+        cos: torch.Tensor, sin: torch.Tensor, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tables for the rotation of ``width`` channels with ``(cos, sin)``."""
+        entry = tables_by_view.get(id(cos))
+        if (
+            entry is not None
+            and entry[0]() is cos
+            and entry[1]() is sin
+            and entry[2] == width
+            and (entry[3] is None or entry[3] == _tp_layout())
+        ):
+            return entry[4] or (cos, sin)
+        tp_layout = None if cos.shape[-1] == width else _tp_layout()
+        local = (
+            (cos, sin)
+            if tp_layout is None
+            else _local_lanes(cos, sin, width, tp_layout)
+        )
+        owned = None
+        if _is_view(local[0]) or _is_view(local[1]):
+            cos_ptr = local[0].untyped_storage().data_ptr()
+            sin_ptr = local[1].untyped_storage().data_ptr()
+            if cos_ptr == 0 or sin_ptr == 0:
+                return local  # Unknown storage: rotate with the views.
+            key = (
+                cos_ptr,
+                sin_ptr,
+                local[0].storage_offset(),
+                tuple(local[0].shape),
+                local[0].stride(),
+                local[1].storage_offset(),
+                tuple(local[1].shape),
+                local[1].stride(),
+                local[0].dtype,
+                local[0].device,
+            )
+            cached = owned_tables.get(key)
+            if cached is None:
+                owned = (fresh_buffer(local[0]), fresh_buffer(local[1]))
+                synchronize_tensors(list(owned), wait=False)
+                if len(owned_tables) >= _MAX_OWNED_ROPE_LAYOUTS:
+                    owned_tables.clear()
+                    tables_by_view.clear()
+                # The entry keeps the views: their storage, and with it the
+                # data pointers in the key, stays valid while it is cached.
+                owned_tables[key] = (*local, *owned)
+            else:
+                owned = (cached[2], cached[3])
+        if owned is None and tp_layout is not None:
+            return local  # Lanes without an owned copy are cut again next time.
+        if len(tables_by_view) >= _MAX_ROPE_VIEW_ENTRIES:
+            tables_by_view.clear()
+        tables_by_view[id(cos)] = (
+            weakref.ref(cos),
+            weakref.ref(sin),
+            width,
+            tp_layout,
+            owned,
+        )
+        return owned or local
+
+    def _apply_split_rotary_emb(
+        x: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor],
+        *,
+        head_dim: int,
+    ) -> torch.Tensor:
+        cos, sin = freqs
+        if cos.ndim != 4 or cos.shape[1] != 1 or cos.shape[-1] == head_dim // 2:
+            return orig_apply_split_rotary_emb(x, freqs, head_dim=head_dim)
+        width = x.shape[-1]
+        if not torch.compiler.is_compiling():
+            cos, sin = _rotation_tables(cos, sin, width)
+        elif cos.shape[-1] != width:
+            cos, sin = _local_lanes(cos, sin, width, _tp_layout())
+        return apply_split_rotary_half_swap(x, cos, sin, head_dim)
+
+    setattr(_cached_rope_forward, _SPLIT_ROPE_PATCHED, True)
+    rope_cls.forward = _cached_rope_forward
+    ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
+    logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
 
 
 def _patch_ltx2_per_batch_timestep() -> None:
