@@ -37,6 +37,7 @@ _LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED = "_tpu_ltx2_guidance_sigma_scalar_patched"
 # drops entries whose sigma tensors are gone.
 _MAX_SIGMA_CACHE_ENTRIES = 8
 _LTX2_ASYNC_STEP_PATCHED = "_tpu_ltx2_async_step_patched"
+_LTX2_FAST_ATTENTION_DISPATCH_PATCHED = "_tpu_ltx2_fast_attention_dispatch_patched"
 
 
 def apply_ltx2_patches() -> None:
@@ -45,6 +46,7 @@ def apply_ltx2_patches() -> None:
     _patch_ltx2_per_batch_timestep()
     _patch_ltx2_guidance_sigma_scalar()
     _patch_ltx2_async_guidance_step()
+    _patch_ltx2_fast_attention_dispatch()
 
 
 def _patch_ltx2_split_rope() -> None:
@@ -614,3 +616,94 @@ def _patch_ltx2_async_guidance_step() -> None:
     logger.info(
         "Applied TPU patch: non-blocking async guidance-parallel step boundary."
     )
+
+
+def _patch_ltx2_fast_attention_dispatch() -> None:
+    """Skip per-call ``inspect.signature`` reflection in ``LTX2Attention``.
+
+    Upstream provenance (vllm-omni 0.32.0rc1):
+    ``vllm_omni/diffusion/models/ltx2/ltx2_transformer.py``
+    (``LTX2Attention.forward``).
+
+    Upstream ``LTX2Attention.forward`` calls
+    ``inspect.signature(self.processor.__call__)`` and builds filtered kwargs on
+    all 288 attention calls per step (11,520 calls per 40-step run, about
+    19 ms/step of host time per worker under 8-worker load). The plain 6-arg
+    call on the default ``LTX2AudioVideoAttnProcessor`` (which accepts
+    ``perturbation_mask``) goes straight to the processor. Any other processor,
+    or extra kwargs, takes upstream's filtering path with the signature cached
+    per processor class.
+
+    REMOVAL / FIX CONDITION:
+    Remove once vLLM-Omni caches the processor signature in
+    ``LTX2Attention.forward``.
+    """
+    import inspect
+    import types
+
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    attention_cls = ltx2_transformer.LTX2Attention
+    default_processor_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    if getattr(attention_cls.forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, False):
+        return
+
+    sig_cache: dict[Any, frozenset[str]] = {}
+
+    def _fast_ltx2_attention_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        perturbation_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        processor = self.processor
+        if not kwargs and type(processor) is default_processor_cls:
+            return processor(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                attention_mask,
+                query_rotary_emb,
+                key_rotary_emb,
+                perturbation_mask=perturbation_mask,
+            )
+        if perturbation_mask is not None:
+            kwargs["perturbation_mask"] = perturbation_mask
+        if isinstance(processor, types.MethodType):
+            cache_key: Any = processor.__func__
+            proc_name = getattr(cache_key, "__qualname__", cache_key.__name__)
+        elif isinstance(processor, (types.FunctionType, types.BuiltinFunctionType)):
+            cache_key = processor
+            proc_name = getattr(processor, "__qualname__", processor.__name__)
+        else:
+            cache_key = type(processor)
+            proc_name = cache_key.__name__
+        attn_parameters = sig_cache.get(cache_key)
+        if attn_parameters is None:
+            attn_parameters = frozenset(inspect.signature(processor).parameters.keys())
+            sig_cache[cache_key] = attn_parameters
+        unused_kwargs = [k for k in kwargs if k not in attn_parameters]
+        if unused_kwargs:
+            logger.warning(
+                "attention_kwargs %s are not expected by %s and will be ignored.",
+                unused_kwargs,
+                proc_name,
+            )
+        return processor(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            attention_mask,
+            query_rotary_emb,
+            key_rotary_emb,
+            **{k: v for k, v in kwargs.items() if k in attn_parameters},
+        )
+
+    setattr(_fast_ltx2_attention_forward, _LTX2_FAST_ATTENTION_DISPATCH_PATCHED, True)
+    attention_cls.forward = _fast_ltx2_attention_forward
+    logger.info("Applied TPU patch: fast LTX-2 attention processor dispatch.")

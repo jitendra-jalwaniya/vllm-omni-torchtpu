@@ -41,6 +41,9 @@ from vllm_omni_torchtpu.patches.ltx2 import (
 from vllm_omni_torchtpu.patches.ltx2 import (
     apply_ltx2_patches,
 )
+from vllm_omni_torchtpu.patches.ulysses import (
+    _patch_ulysses_inference_all_to_all_4d,
+)
 
 logger = init_logger(__name__)
 
@@ -97,6 +100,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
     apply_ltx2_patches()
+    _patch_ulysses_inference_all_to_all_4d()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
