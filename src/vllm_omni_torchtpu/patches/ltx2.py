@@ -47,6 +47,9 @@ def apply_ltx2_patches() -> None:
     _patch_ltx2_guidance_sigma_scalar()
     _patch_ltx2_async_guidance_step()
     _patch_ltx2_fast_attention_dispatch()
+    from vllm_omni_torchtpu.ltx2_compile import apply_ltx2_compile_patches
+
+    apply_ltx2_compile_patches()
 
 
 def _patch_ltx2_split_rope() -> None:
